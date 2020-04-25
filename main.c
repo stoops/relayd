@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <string.h>
+#include <ctype.h>
 
 #include "relayd.h"
 
@@ -50,6 +51,15 @@ struct relayd_pending_route {
 	struct uloop_timeout timeout;
 	uint8_t gateway[4];
 };
+
+#define ARP_SIZE 257
+struct static_arp {
+	int leng; char *path;
+	char line[ARP_SIZE][128], bifs[4][32];
+	struct relayd_host host[ARP_SIZE];
+	struct uloop_timeout timeout;
+};
+struct static_arp sarp;
 
 static struct relayd_host *find_host_by_ipaddr(struct relayd_interface *rif, const uint8_t *ipaddr)
 {
@@ -81,7 +91,7 @@ static void add_arp(struct relayd_host *host)
 	struct arpreq arp;
 
 	strncpy(arp.arp_dev, host->rif->ifname, sizeof(arp.arp_dev));
-	arp.arp_flags = ATF_COM;
+	arp.arp_flags = (host->cleanup_pending == -99) ? ATF_PERM : ATF_COM;
 
 	arp.arp_ha.sa_family = ARPHRD_ETHER;
 	memcpy(arp.arp_ha.sa_data, host->lladdr, ETH_ALEN);
@@ -90,7 +100,96 @@ static void add_arp(struct relayd_host *host)
 	sin->sin_family = AF_INET;
 	memcpy(&sin->sin_addr, host->ipaddr, sizeof(host->ipaddr));
 
-	ioctl(inet_sock, SIOCSARP, &arp);
+	int io_run = 1;
+	unsigned long io_req = (host->cleanup_pending == -98) ? SIOCDARP : SIOCSARP;
+	for (int x = 0; (host->cleanup_pending > -90) && (x < sarp.leng); ++x) {
+		if (bcmp((sarp.host)[x].ipaddr, host->ipaddr, 4) == 0) {
+			io_run = 0;
+		}
+	}
+
+	if (io_run == 1) {
+		ioctl(inet_sock, io_req, &arp);
+	}
+}
+
+static void read_arps(struct uloop_timeout *timeout)
+{
+	int y, z;
+	char l[128];
+	char *p = NULL, *q, *d;
+	uint8_t *e;
+	FILE *f = NULL;
+	struct relayd_host *t, *u;
+
+	if (sarp.path != NULL) { f = fopen(sarp.path, "r"); }
+
+	if (f != NULL) {
+		for (int x = 0; (x < (ARP_SIZE - 1)) && ((x == 0) || (p != NULL)); ++x) {
+			bzero(l, 128 * sizeof(char)); p = fgets(l, 90, f);
+			if ((p != NULL) && (strlen(p) > 24)) {
+				sarp.leng = (x + 1);
+
+				if (bcmp(l, (sarp.line)[x], 100 * sizeof(char)) != 0) {
+					bzero((sarp.line)[x], 128 * sizeof(char));
+					bcopy(l, (sarp.line)[x], 90 * sizeof(char));
+					printf("l [%d][%s]\n", x, l);
+
+					/* copy interface dev name */
+					y = 0; d = ((sarp.host)[x].rif)->ifname;
+					bzero(d, IFNAMSIZ * sizeof(char));
+					while ((y < (IFNAMSIZ - 1)) && (*p != ' ') && (*p != '\0')) {
+						*d = *p; ++d; ++p; ++y;
+					}
+					while ((*p == ' ') || (*p == '\t')) { ++p; }
+
+					/* parse mac address */
+					y = 0; e = (sarp.host)[x].lladdr;
+					while ((y < 6) && (*p != ' ') && (*p != '\0')) {
+						for (*e = 0, z = 0; z < 2; ++z) {
+							l[99] = tolower(*p); ++p; *e = (*e << 4);
+							*e += (l[99] <= '9') ? (l[99] - '0') : ((l[99] - 'a') + 10);
+						}
+						++e; ++p; ++y;
+					}
+					while ((*p == ' ') || (*p == '\t')) { ++p; }
+
+					/* parse ip address */
+					e = (sarp.host)[x].ipaddr;
+					for (y = 0; (y < 4) && (*p != ' ') && (*p != '\0'); ++y) {
+						for (z = 1; (z < 4) && (p[z] != ' ') && (p[z] != '\0'); ++z) {
+							if ((p[z] == '.') || (p[z] == '\n')) { p[z] = '\0'; break; }
+						}
+						e[y] = atoi(p); p+=(z+1);
+					}
+				}
+
+				/* add static arp entry (perm) */
+				t = &((sarp.host)[x]);
+				t->cleanup_pending = -99;
+				add_arp(t);
+
+				/* del any other host related arp entries */
+				for (z = 0; z < 4; ++z) {
+					q = (sarp.bifs)[z];
+					p = (t->rif)->ifname;
+					e = t->ipaddr;
+					if ((strlen(q) > 0) && (bcmp(q, p, IFNAMSIZ - 1) != 0)) {
+						u = &((sarp.host)[ARP_SIZE-1]);
+						bcopy(q, (u->rif)->ifname, IFNAMSIZ - 1);
+						bzero(u->lladdr, 6 * sizeof(uint8_t));
+						bcopy(e, u->ipaddr, 4 * sizeof(uint8_t));
+						u->cleanup_pending = -98;
+						add_arp(u);
+					}
+				}
+			}
+		}
+
+		fclose(f);
+	}
+
+	if (timeout != NULL) { uloop_timeout_set(timeout, 10 * 1000); }
 }
 
 static void timeout_host_route(struct uloop_timeout *timeout)
@@ -698,6 +797,7 @@ static int usage(const char *progname)
 			"	-D		Enable DHCP forwarding\n"
 			"	-P		Disable DHCP options parsing\n"
 			"	-L <ipaddr>	Enable local access using <ipaddr> as source address\n"
+			"	-s <fname>	Static arp file\n"
 			"\n",
 		progname);
 	return -1;
@@ -720,6 +820,8 @@ int main(int argc, char **argv)
 		perror("socket(AF_INET)");
 		return 1;
 	}
+	sarp.leng = 0; sarp.path = NULL;
+	for (int x = 0; x < 4; ++x) { bzero((sarp.bifs)[x], 32 * sizeof(char)); }
 
 	host_timeout = 30;
 	host_ping_tries = 5;
@@ -728,11 +830,13 @@ int main(int argc, char **argv)
 	parse_dhcp = 1;
 	uloop_init();
 
-	while ((ch = getopt(argc, argv, "I:i:t:p:BDPdT:G:R:L:")) != -1) {
+	while ((ch = getopt(argc, argv, "I:i:t:p:BDPdT:G:R:L:s:")) != -1) {
 		switch(ch) {
 		case 'I':
 			managed = true;
 			/* fall through */
+			bzero((sarp.bifs)[ifnum%4], 32 * sizeof(char));
+			strncpy((sarp.bifs)[ifnum%4], optarg, 15);
 		case 'i':
 			ifnum++;
 			rif = alloc_interface(optarg, managed);
@@ -750,6 +854,13 @@ int main(int argc, char **argv)
 			host_ping_tries = atoi(optarg);
 			if (host_ping_tries <= 0)
 				return usage(argv[0]);
+			break;
+		case 's':
+			sarp.path = strdup(optarg);
+			for (int x = 0; x < ARP_SIZE; ++x) {
+				(sarp.host)[x].rif = malloc(1 * sizeof(struct relayd_interface));
+			}
+			//read_arps(NULL);
 			break;
 		case 'd':
 			debug++;
@@ -842,6 +953,10 @@ int main(int argc, char **argv)
 		return 1;
 
 	ping_static_routes();
+
+	bzero(&(sarp.timeout), sizeof(struct uloop_timeout));
+	sarp.timeout.cb = read_arps;
+	uloop_timeout_set(&sarp.timeout, 10 * 1000);
 
 	uloop_run();
 	uloop_done();
