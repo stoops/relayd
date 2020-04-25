@@ -262,6 +262,9 @@ static void host_entry_timeout(struct uloop_timeout *timeout)
 	 * When the timeout is reached, try pinging the host a few times before
 	 * giving up on it.
 	 */
+	if (host_ping_tries <= 0) {
+		return;
+	}
 	if (host->rif->managed && host->cleanup_pending < host_ping_tries) {
 		list_for_each_entry(rif, &interfaces, list) {
 			send_arp_request(rif, host->ipaddr);
@@ -288,7 +291,8 @@ static struct relayd_host *add_host(struct relayd_interface *rif, const uint8_t 
 	memcpy(host->lladdr, lladdr, sizeof(host->lladdr));
 	list_add(&host->list, &rif->hosts);
 	host->timeout.cb = host_entry_timeout;
-	uloop_timeout_set(&host->timeout, host_timeout * 1000);
+	if (host_timeout > 0)
+		uloop_timeout_set(&host->timeout, host_timeout * 1000);
 
 	add_arp(host);
 	if (rif->managed)
@@ -339,14 +343,18 @@ struct relayd_host *relayd_refresh_host(struct relayd_interface *rif, const uint
 		 * before we expire it
 		 */
 		if (host && !host->cleanup_pending) {
-			uloop_timeout_set(&host->timeout, 1);
+			if (host_timeout > 0)
+				uloop_timeout_set(&host->timeout, host_timeout * 1000);
+
 			return NULL;
 		}
 
 		host = add_host(rif, lladdr, ipaddr);
 	} else {
 		host->cleanup_pending = false;
-		uloop_timeout_set(&host->timeout, host_timeout * 1000);
+		if (host_timeout > 0)
+			uloop_timeout_set(&host->timeout, host_timeout * 1000);
+
 		send_gratuitous_arp(rif, ipaddr);
 	}
 
@@ -743,13 +751,9 @@ int main(int argc, char **argv)
 			break;
 		case 't':
 			host_timeout = atoi(optarg);
-			if (host_timeout <= 0)
-				return usage(argv[0]);
 			break;
 		case 'p':
 			host_ping_tries = atoi(optarg);
-			if (host_ping_tries <= 0)
-				return usage(argv[0]);
 			break;
 		case 'd':
 			debug++;
