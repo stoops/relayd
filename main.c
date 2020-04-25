@@ -17,6 +17,7 @@
  */
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #include <stdio.h>
 #include <unistd.h>
@@ -56,6 +57,7 @@ struct relayd_pending_route {
 struct static_arp {
 	int leng; char *path;
 	char line[ARP_SIZE][128], bifs[4][32];
+	time_t msec;
 	struct relayd_host host[ARP_SIZE];
 	struct uloop_timeout timeout;
 };
@@ -113,6 +115,15 @@ static void add_arp(struct relayd_host *host)
 	}
 }
 
+int route_cmd(char *host, char *intf, char m) {
+	char *cmds = "ip -4 route"; char comd[128];
+	bzero(comd, 128 * sizeof(char));
+	if (m == 'g') { snprintf(comd, 120, "%s | grep -i '^%s .* %s ' >/dev/null", cmds, host, intf); }
+	if (m == 'a') { snprintf(comd, 120, "%s replace '%s/32' dev '%s' proto static", cmds, host, intf); }
+	if (m == 'd') { snprintf(comd, 120, "%s del '%s'", cmds, host); }
+	return system(comd);
+}
+
 static void read_arps(struct uloop_timeout *timeout)
 {
 	int y, z;
@@ -120,9 +131,19 @@ static void read_arps(struct uloop_timeout *timeout)
 	char *p = NULL, *q, *d;
 	uint8_t *e;
 	FILE *f = NULL;
+	time_t tsec;
+	struct stat info;
 	struct relayd_host *t, *u;
 
-	if (sarp.path != NULL) { f = fopen(sarp.path, "r"); }
+	if (sarp.path != NULL) {
+		stat(sarp.path, &info);
+		tsec = info.st_mtime;
+		if (tsec > sarp.msec) {
+			printf("f [%ld][%ld]\n",tsec,sarp.msec);
+			f = fopen(sarp.path, "r");
+			sarp.msec = tsec;
+		}
+	}
 
 	if (f != NULL) {
 		for (int x = 0; (x < (ARP_SIZE - 1)) && ((x == 0) || (p != NULL)); ++x) {
@@ -168,6 +189,9 @@ static void read_arps(struct uloop_timeout *timeout)
 				t = &((sarp.host)[x]);
 				t->cleanup_pending = -99;
 				add_arp(t);
+				bzero(l, 128 * sizeof(char));
+				snprintf(l, 90, "%d.%d.%d.%d", t->ipaddr[0], t->ipaddr[1], t->ipaddr[2], t->ipaddr[3]);
+				route_cmd(l, (t->rif)->ifname, 'a');
 
 				/* del any other host related arp entries */
 				for (z = 0; z < 4; ++z) {
@@ -189,7 +213,9 @@ static void read_arps(struct uloop_timeout *timeout)
 		fclose(f);
 	}
 
-	if (timeout != NULL) { uloop_timeout_set(timeout, 10 * 1000); }
+	if ((timeout != NULL) && (host_timeout > 0)) {
+		uloop_timeout_set(timeout, host_timeout * 1000);
+	}
 }
 
 static void timeout_host_route(struct uloop_timeout *timeout)
@@ -204,6 +230,9 @@ static void timeout_host_route(struct uloop_timeout *timeout)
 void relayd_add_host_route(struct relayd_host *host, const uint8_t *dest, uint8_t mask)
 {
 	struct relayd_route *rt;
+
+	if (sarp.path != NULL)
+		return;
 
 	list_for_each_entry(rt, &host->routes, list) {
 		if (!memcmp(rt->dest, dest, sizeof(rt->dest)) && rt->mask == mask)
@@ -361,7 +390,24 @@ static void host_entry_timeout(struct uloop_timeout *timeout)
 	 * When the timeout is reached, try pinging the host a few times before
 	 * giving up on it.
 	 */
-	if (host_ping_tries <= 0) {
+	if ((host_ping_tries <= 0) || (sarp.path != NULL)) {
+		int delh, ilen;
+		struct relayd_host *temp;
+		for (int x = 0; x < sarp.leng; ++x) {
+			temp = &((sarp.host)[x]);
+			if (bcmp(host->ipaddr, temp->ipaddr, 4) == 0) {
+				delh = 0; ilen = strlen((temp->rif)->ifname);
+				if (bcmp(host->lladdr, temp->lladdr, 6) != 0) { delh = 1; }
+				if ((delh == 0) && (strlen((host->rif)->ifname) != ilen)) { delh = 1; }
+				if ((delh == 0) && (strncmp((host->rif)->ifname, (temp->rif)->ifname, ilen) != 0)) { delh = 1; }
+				if (delh == 1) {
+					printf("del host stat [%d.%d.%d.%d]...\n",
+						host->ipaddr[0], host->ipaddr[1], host->ipaddr[2], host->ipaddr[3]);
+					del_host(host); return;
+				}
+			}
+		}
+		if (host_timeout > 0) { uloop_timeout_set(&host->timeout, host_timeout * 1000); }
 		return;
 	}
 	if (host->rif->managed && host->cleanup_pending < host_ping_tries) {
@@ -393,15 +439,21 @@ static struct relayd_host *add_host(struct relayd_interface *rif, const uint8_t 
 	if (host_timeout > 0)
 		uloop_timeout_set(&host->timeout, host_timeout * 1000);
 
-	add_arp(host);
-	if (rif->managed)
-		relayd_add_route(host, NULL);
+	if (sarp.path == NULL) {
+
+		add_arp(host);
+		if (rif->managed)
+			relayd_add_route(host, NULL);
+
+	}
 
 	list_for_each_entry_safe(route, rtmp, &pending_routes, rt.list) {
 		if (memcmp(route->gateway, ipaddr, 4) != 0)
 			continue;
 
-		relayd_add_host_route(host, route->rt.dest, route->rt.mask);
+		if (sarp.path == NULL)
+			relayd_add_host_route(host, route->rt.dest, route->rt.mask);
+
 		if (!route->timeout.pending)
 			continue;
 
@@ -828,7 +880,7 @@ int main(int argc, char **argv)
 		perror("socket(AF_INET)");
 		return 1;
 	}
-	sarp.leng = 0; sarp.path = NULL;
+	sarp.leng = 0; sarp.msec = 0; sarp.path = NULL;
 	for (int x = 0; x < 4; ++x) { bzero((sarp.bifs)[x], 32 * sizeof(char)); }
 
 	host_timeout = 30;
@@ -960,7 +1012,7 @@ int main(int argc, char **argv)
 
 	bzero(&(sarp.timeout), sizeof(struct uloop_timeout));
 	sarp.timeout.cb = read_arps;
-	uloop_timeout_set(&sarp.timeout, 10 * 1000);
+	if (host_timeout > 0) { uloop_timeout_set(&sarp.timeout, host_timeout * 1000); }
 
 	uloop_run();
 	uloop_done();
