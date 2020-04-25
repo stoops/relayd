@@ -93,6 +93,33 @@ static void add_arp(struct relayd_host *host)
 	ioctl(inet_sock, SIOCSARP, &arp);
 }
 
+struct arpreq del_arp(const uint8_t *ipaddr, const char *ifname, char m)
+{
+	struct sockaddr_in *sin;
+	static struct arpreq arp;
+
+	bzero(&arp, sizeof(arp));
+	strncpy(arp.arp_dev, ifname, sizeof(arp.arp_dev));
+
+	sin = (struct sockaddr_in *)&arp.arp_pa;
+	sin->sin_family = AF_INET;
+	memcpy(&sin->sin_addr, ipaddr, 4);
+
+	if (m == 'g') { ioctl(inet_sock, SIOCGARP, &arp); }
+	else { ioctl(inet_sock, SIOCDARP, &arp); }
+
+	return arp;
+}
+
+int route_cmd(char *host, char *intf, char m) {
+	char *cmds = "ip -4 route"; char comd[128];
+	bzero(comd, 128 * sizeof(char));
+	if (m == 'g') { snprintf(comd, 120, "%s | grep -i '^%s .* %s ' >/dev/null", cmds, host, intf); }
+	if (m == 'a') { snprintf(comd, 120, "%s replace '%s/32' dev '%s' proto static", cmds, host, intf); }
+	if (m == 'd') { snprintf(comd, 120, "%s del '%s'", cmds, host); }
+	return system(comd);
+}
+
 static void timeout_host_route(struct uloop_timeout *timeout)
 {
 	struct relayd_pending_route *rt;
@@ -105,6 +132,9 @@ static void timeout_host_route(struct uloop_timeout *timeout)
 void relayd_add_host_route(struct relayd_host *host, const uint8_t *dest, uint8_t mask)
 {
 	struct relayd_route *rt;
+
+	if (host_ping_tries <= 0)
+		return;
 
 	list_for_each_entry(rt, &host->routes, list) {
 		if (!memcmp(rt->dest, dest, sizeof(rt->dest)) && rt->mask == mask)
@@ -254,6 +284,10 @@ static void host_entry_timeout(struct uloop_timeout *timeout)
 {
 	struct relayd_host *host = container_of(timeout, struct relayd_host, timeout);
 	struct relayd_interface *rif;
+	int ilen = 8, anum = 0, leng = 0, aidx = -1, sidx = -1, ssoc;
+	char ipfs[32];
+	struct arpreq arpr[ilen];
+	struct sockaddr_in sobj;
 
 	/*
 	 * When a host is behind a managed interface, we must not expire its host
@@ -263,6 +297,51 @@ static void host_entry_timeout(struct uloop_timeout *timeout)
 	 * giving up on it.
 	 */
 	if (host_ping_tries <= 0) {
+		bzero(ipfs, 32 * sizeof(char));
+		snprintf(ipfs, 30, "%d.%d.%d.%d", host->ipaddr[0], host->ipaddr[1], host->ipaddr[2], host->ipaddr[3]);
+
+		list_for_each_entry(rif, &interfaces, list) {
+			if (leng < ilen) {
+				arpr[leng] = del_arp(host->ipaddr, rif->ifname, 'g');
+				if (arpr[leng].arp_flags >= 1) { aidx = leng; ++anum; }
+				if (arpr[leng].arp_flags == 6) { sidx = leng; }
+				++leng;
+			}
+		}
+
+		if (anum != 1) {
+			printf("del host [%s] [%d][%d]\n", ipfs, anum, host->cleanup_pending);
+
+			for (int x = 0; x < leng; ++x) {
+				if (arpr[x].arp_flags == 6) { continue; }
+				del_arp(host->ipaddr, arpr[x].arp_dev, 'd');
+				route_cmd(ipfs, arpr[x].arp_dev, 'd');
+				if ((ssoc = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) >= 0) {
+					if (setsockopt(ssoc, SOL_SOCKET, SO_BINDTODEVICE, arpr[x].arp_dev, strlen(arpr[x].arp_dev)) >= 0) {
+						memset(&sobj, 0, sizeof(sobj));
+						sobj.sin_family = AF_INET;
+						memcpy(&(sobj.sin_addr), host->ipaddr, 4);
+						sobj.sin_port = htons(1);
+						sendto(ssoc, "01234567", 8, 0, (struct sockaddr *)&sobj, sizeof(sobj));
+					}
+					close(ssoc);
+				}
+			}
+
+			host->cleanup_pending += 1;
+		}
+
+		if ((sidx < 0) && (anum == 1)) { sidx = aidx; }
+		if (sidx > -1) {
+			if (route_cmd(ipfs, arpr[sidx].arp_dev, 'g') != 0) {
+				printf("route host [%s] [%d][%s]\n", ipfs, sidx, arpr[sidx].arp_dev);
+				route_cmd(ipfs, arpr[sidx].arp_dev, 'a');
+			}
+			host->cleanup_pending = 0;
+		}
+
+		if (host->cleanup_pending > 5) { del_host(host); return; }
+		if (host_timeout > 0) { uloop_timeout_set(&host->timeout, host_timeout * 1000); }
 		return;
 	}
 	if (host->rif->managed && host->cleanup_pending < host_ping_tries) {
@@ -294,15 +373,23 @@ static struct relayd_host *add_host(struct relayd_interface *rif, const uint8_t 
 	if (host_timeout > 0)
 		uloop_timeout_set(&host->timeout, host_timeout * 1000);
 
-	add_arp(host);
-	if (rif->managed)
-		relayd_add_route(host, NULL);
+	if (host_ping_tries > 0) {
+
+		add_arp(host);
+		if (rif->managed)
+			relayd_add_route(host, NULL);
+
+	} else {
+		printf("add host [%d.%d.%d.%d]...\n", ipaddr[0], ipaddr[1], ipaddr[2], ipaddr[3]);
+	}
 
 	list_for_each_entry_safe(route, rtmp, &pending_routes, rt.list) {
 		if (memcmp(route->gateway, ipaddr, 4) != 0)
 			continue;
 
-		relayd_add_host_route(host, route->rt.dest, route->rt.mask);
+		if (host_ping_tries > 0)
+			relayd_add_host_route(host, route->rt.dest, route->rt.mask);
+
 		if (!route->timeout.pending)
 			continue;
 
