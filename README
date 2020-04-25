@@ -1,0 +1,13 @@
+opkg update
+opkg install gcc -d ram
+
+git clone https://git.openwrt.org/project/libubox.git
+
+export PATH="/tmp/usr/bin:$PATH"
+export LD_LIBRARY_PATH=/tmp/usr/lib:/usr/lib:/lib:.
+export CPATH=/tmp/usr/include:.
+export LIBRARY_PATH="$LD_LIBRARY_PATH"
+
+gcc -fpic -c $(cat CMakeLists.txt | grep -i 'set.*sources' | sed -e 's/^[^ ]*//' -e 's/.$//')
+gcc -shared -o ../libfoo.so *.o
+gcc -Wall -o relayd main.c dhcp.c route.c -lfoo
